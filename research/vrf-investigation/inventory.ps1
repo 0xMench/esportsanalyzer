@@ -78,5 +78,5 @@ Write-Host ""
 Write-Host "READ-OUT:" -ForegroundColor Cyan
 Write-Host "  * MatchId = Riot match id (the filename). Build = game patch. Both plaintext."
 Write-Host "  * Players<10 or Magic='??' on an OLD file = the format shifted for that patch"
-Write-Host "    (this is your old-patch fragility test — sort by Build to see the spread)."
+Write-Host "    (this is your old-patch fragility test - sort by Build to see the spread)."
 Write-Host "  * Players column counts unique PUUIDs. Competitive strips names but keeps PUUIDs."
