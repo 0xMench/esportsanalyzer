@@ -1,200 +1,195 @@
 # Valorant .vrf parsing — de-risking report
 
-**Date:** 2026-08-27 · **Author:** investigation session · **Status:** desk research only.
+**Date:** 2026-08-27 · **Status:** desk research + partial verification against one real file.
 
-> **Read this first.** This ran in a cloud Linux sandbox with **no access to your
-> Windows machine or your ~20 replays**. Nothing here was tested against a real
-> `.vrf`. Every claim is either (a) from the parsers' own source/docs and Riot's
-> published policy — solid, or (b) marked **UNVERIFIED** — you confirm it by running
-> `inventory.ps1`, `sniff_header.py`, and the `parse_one.md` runbook on your files.
-> The blunt stuff you asked for is not softened.
+> **What changed in this revision.** The first draft was pure desk research (no
+> file access). We then ran `sniff_header.py` against a **real competitive replay**
+> (match `67933ad4…`, map **Ascent**, build **release-13.04**). That verified some
+> claims and **overturned two of them** — the header is plaintext (not encrypted),
+> and competitive replays **retain all 10 players' PUUIDs** even though display
+> names are stripped. Verified facts are tagged **[VERIFIED: 1 file]**; things still
+> resting on one file or on docs are tagged **[UNVERIFIED]** / **[1 file only]**.
+
+## VERIFIED against a real competitive `.vrf` (build release-13.04)
+
+- **Container magic is `0x43F4EFDD`** (Riot's own), *not* vanilla Unreal's
+  `0x1CA2E27F`. The first draft's sniffer looked for the wrong magic and wrongly
+  concluded "encrypted." **The header is plaintext.**
+- **Map and patch are in the clear:** `/Game/Maps/Ascent/Ascent` → Ascent;
+  `++Ares-Core+release-13.04` → the build/patch. Readable with zero decompression.
+- **A JSON player-loadout block is plaintext**, containing per player a
+  `"subject"` (**Riot PUUID — a stable account id**) and a `"characterId"`
+  (**agent UUID**; e.g. `1e58de9c-…` = Killjoy).
+- **Competitive anonymization is display-name-only.** In the tested file:
+  **10 unique PUUIDs**, 6 unique agents (agents overlap across the two teams),
+  and **zero** `gameName`/`tagLine`/`displayName` fields. Riot strips the names
+  you *see* but leaves the account ids that identify everyone.
+- Only the per-tick **network stream after the header is Oodle-compressed** — that
+  part still needs the full parser.
 
 ---
 
-## TASK 1 — Where files live (needs your confirmation)
+## TASK 1 — Where files live + inventory
 
-- **Path:** `%LOCALAPPDATA%\VALORANT\Saved\Demos` → e.g.
-  `C:\Users\<you>\AppData\Local\VALORANT\Saved\Demos`. AppData is hidden by
-  default, which is why people think the folder is missing.
-- **Naming:** each file is `<match-id>.vrf`, a GUID like
-  `b9946017-117f-4a22-9d27-cbd17ab12a93.vrf`. **The filename is the Riot match id.**
-  That single fact does a lot of work in Task 3.
-- **Size:** ~40–70 MB each (consistent with your "files are large" note).
-- **Retention:** Valorant keeps only your recent matches and **auto-deletes older
-  ones**. Copy replays out before analyzing — this also means your "oldest files"
-  for Task 5's old-patch test may already be gone. Check.
-- `inventory.ps1` gives you reliable size/timestamp/match-id today. Map/patch/
-  duration from the header is best-effort — see Task 5.
+- **Path:** `%LOCALAPPDATA%\VALORANT\Saved\Demos` → `C:\Users\<you>\AppData\Local\
+  VALORANT\Saved\Demos` (AppData is hidden by default). **[VERIFIED: file was here]**
+- **Naming:** `<match-id>.vrf` — the filename is the Riot match id. **[VERIFIED]**
+- **Readable from the header with no parser: match-id, map, build/patch, and the
+  10 player PUUIDs + agents.** `inventory.ps1` now pulls Map / Build / player-count
+  for every file directly. **[VERIFIED: 1 file]**
+- **Match duration:** a `uint32` in the fixed header (~offset 0x20) looks like
+  `lengthInMs`, but I won't assert it off one file — the parser is the reliable
+  source. **[UNVERIFIED]**
+- **Size:** ~40–70 MB. **Retention:** Valorant auto-deletes old matches — copy
+  replays out, and note your oldest ones may already be gone (matters for Task 5).
 
 ---
 
-## TASK 3 — The identity problem (the important one)
+## TASK 3 — The identity problem (rewritten — the first draft was wrong here)
 
-**Anonymization is real and confirmed by multiple independent sources.** In
-**competitive** matches the 10 players show as `Player N` / `Imported Crosshair …`.
-Real Riot IDs only survive in **custom/scrim** replays. So for your actual use
-case (ranked coaching), the names are gone. Verify on your own files with
-`sniff_header.py` and the full parse, but do not expect this to change.
+**First draft said:** competitive scrubs identity, no resolvable account id survives,
+so "the only reliable path is to ask the user to pick their agent."
+**The file says otherwise:** every player's **PUUID is in the replay, in plaintext.**
+Identity is **solvable from the file itself.**
 
-**The reframe that matters:** you don't need names. You need to know **which of
-the 10 anonymized slots is the uploader**. And the replay *does* still expose each
-player's **agent** and **team/side**. In any Valorant match, agents are unique per
-team — no two players on the same side run the same agent. So `(agent, side)` is a
-unique key for all 10 players. That collapses "who is the user" into "which agent
-did the user play," which the user trivially knows.
+**The clean design now:**
+1. User signs in with **Riot Sign-On (RSO)** → you learn *their own* PUUID.
+2. Match that PUUID against the 10 `subject`s in the replay → you have their exact
+   slot and agent. No guessing, no fuzzy correlation.
+3. You never need to resolve the other 9 to coach the uploader.
 
-### Options, ranked by reliability × cost
+### Options, re-ranked with the new evidence
 
 | Rank | Option | Reliability | Cost | Verdict |
 |---|---|---|---|---|
-| **1** | **Ask the user to pick their agent** (+ side if ever ambiguous) | **100%** | **~zero** | **Do this.** |
-| 2 | Match-id → Riot match API, join anon slot ↔ real PUUID on `(agent, team)` | High *if* you get API access | High + ongoing + policy risk | Optional enrichment, not identity |
-| 3 | Crosshair-profile / "Imported Crosshair" string as an identifier | ~0 in comp | low | Doesn't work — it's the anonymized label itself |
-| 4 | A stable per-account ID inside the comp `.vrf` that maps to a Riot account | Unknown, likely absent | — | Don't count on it; comp is scrubbed by design |
+| **1** | **RSO login → match user's PUUID to one of the 10 `subject`s** | **Exact** | Low (RSO only; no match-API call needed for the join) | **Primary path.** The file already contains the answer. |
+| 2 | **Ask the user to pick their agent** | 100% | ~zero | **Keep as the no-login fallback.** Works with no Riot integration at all. |
+| 3 | Resolve all 10 PUUIDs → gamertags via Riot's name API | Exact | Riot production key + policy/privacy risk | Only if you truly need opponents' names. See the flag below. |
+| 4 | Crosshair-profile / "Imported Crosshair" string | ~0 | — | Dead end — it's the anonymization label itself, not a leak. |
 
-**Blunt answer, as requested: the only clean, robust answer is to ask the user to
-pick their agent.** It is free, instant, needs no Riot API, carries no policy risk,
-and is unambiguous because agents are unique per team. Build identity on that.
-Everything else is worse on at least one axis:
+**Blunt guidance:** build identity on **RSO + PUUID match** (exact, minimal), with
+**agent-pick as the offline fallback**. The old "just ask" answer isn't wrong as a
+fallback — it's just no longer the *best* you can do.
 
-- **Option 2** is the *only* thing that gets you real gamertags and enriched stats,
-  and it's genuinely reliable because `(agent, team)` is a clean join key and the
-  match id is sitting in the filename — no fuzzy timestamp/score correlation needed.
-  But: it requires a Riot **production API key** (approval is slow and discretionary),
-  **RSO** so the user authorizes their own account, per-user API calls (so you're
-  back to server + compute you wanted to avoid), and it plants you directly in the
-  policy zone that got Recon Bolt a cease-and-desist (Task 5). Treat it as an
-  *optional "link your Riot account for real names & stats"* feature layered on top
-  of agent-pick — never as the primary identity mechanism.
-- **Option 3** is a category error: "Imported Crosshair" *is* the anonymization, not
-  a leak through it.
-- **Option 4**: no evidence a resolvable account id survives comp anonymization;
-  assume Riot removed it on purpose. Confirm with `sniff_header.py`, but don't
-  design around finding one.
+**The sharpened risk (read this before you de-anonymize anyone):** Riot stripped
+those names on purpose. Reading a PUUID offline is passive; **resolving other
+players' PUUIDs to real gamertags — or displaying identities Riot deliberately
+hid — is exactly the behavior that got Recon Bolt a cease-and-desist**, and it's a
+real player-privacy problem, not just a ToS line. For the **uploader's own**
+account it's fine (their data). For the **other nine**, don't — coach the uploader
+against anonymized opponents.
 
 ---
 
 ## TASK 4 — Architecture: getting a .NET parser to the browser
 
+*(Unchanged by the file evidence — the plaintext header doesn't help here, because
+positions/kills/abilities live in the Oodle-compressed stream. One nuance added.)*
+
 The reference parser is **C#/.NET 10**, event-driven (`IReplayEventSink`,
-`FBinaryArchive`), and depends on **Oodle** decompression. Two hard constraints
-drive everything:
+`FBinaryArchive`), and depends on **Oodle** decompression. Two hard constraints:
 
-1. **Oodle.** Valorant replays are Unreal network replays; the stream chunks are
-   **Oodle (Kraken)**-compressed. Oodle is proprietary (RAD/Epic) with **no
-   browser build and a license you can't ship to a web client.** A community
-   reverse-engineered *decompressor* exists and can be compiled to WASM, but that
-   adds its own legal/maintenance risk. **Oodle is the gate on every client-side
-   path**, not the parser logic.
-2. **Size/CPU.** ~40–70 MB compressed on disk; the web-replayer reports a **~1 GB**
-   fully-decoded intermediate per replay. Decode + walk-the-stream is seconds of
-   CPU and hundreds of MB of RAM. In a browser tab that is **exactly the 5-second
-   freeze you said kills the product** — unless it runs off the main thread.
+1. **Oodle.** The stream chunks are **Oodle (Kraken)**-compressed. Oodle is
+   proprietary (RAD/Epic), with no browser build and a license you can't ship to a
+   web client. A reverse-engineered *decompressor* exists and can be WASM-compiled,
+   but adds legal/maintenance risk. **This gates every client-side path.**
+2. **Size/CPU.** ~40–70 MB on disk; the web-replayer reports a **~1 GB** decoded
+   intermediate. Decode + walk is seconds of CPU and hundreds of MB of RAM — the
+   **5-second tab-freeze you said kills the product**, unless it runs off-thread.
 
-| Path | What it really costs | Parse-time / freeze risk | Verdict |
+| Path | What it really costs | Freeze risk | Verdict |
 |---|---|---|---|
-| **Port to Rust → WASM** | Rewrite the whole parser (it's C#, not Rust — this is a *rewrite*, not a recompile) **and** solve Oodle-in-WASM. Months. | Good *if* run in a **Web Worker** (no UI freeze) — but big transient RAM (~hundreds MB) can still OOM mobile tabs | Best *eventual* client-side story; **do not start here** |
-| **.NET → WASM (Blazor WASM)** | Ship the C# nearly as-is. But Blazor WASM runtime download is heavy, it's slower than native, **Oodle native .dll won't load in the WASM sandbox** (you'd still need a WASM Oodle), and 1 GB working set in the .NET/WASM heap is brutal | High freeze/OOM risk unless workerized; runtime cold-start is its own UX cost | Tempting (reuses C#) but the Oodle + memory wall makes it fragile |
-| **Server-side parse on upload** | A box with .NET + Oodle. Per-user compute (the thing you wanted to avoid) + 40–70 MB uploads + ~1 GB transient disk/RAM per job | **Zero** browser freeze — nothing heavy runs client-side | **Start here.** It's literally what ValorantWebReplayer already does. |
+| **Rust → WASM** | Full rewrite (C#→Rust) **and** solve Oodle-in-WASM. Months. | Low *in a Web Worker*; big transient RAM can OOM mobile | Best *eventual* client path; not first |
+| **.NET → WASM (Blazor)** | Reuse the C#, but Oodle native `.dll` won't load in the WASM sandbox, heavy runtime, 1 GB heap is brutal | High unless workerized | **Trap** — looks free, hits both walls |
+| **Server-side parse on upload** | Box with .NET + Oodle; per-user compute + uploads + ~1 GB transient/job | **Zero** client freeze | **Start here** — what ValorantWebReplayer already does |
 
-**Recommendation — blunt:** start **server-side**. It's the only path where the
-parser already runs today, it sidesteps Oodle-in-the-browser entirely, and it
-removes the freeze risk by construction. Yes, it's the per-user compute you didn't
-want — but a `.vrf` decode is a batch job (seconds, then cache the JSON forever),
-not a live per-frame cost. Parse once on upload, store the compact JSON, and every
-later view/coaching pass is cheap. Revisit Rust→WASM only if server compute
-becomes a real cost problem at scale, and only after someone has a shippable WASM
-Oodle decompressor. **Blazor WASM is the trap option**: it looks like a free reuse
-of the C# code but you still hit the Oodle wall and the memory wall, just with a
-heavier runtime.
+**Recommendation:** **parse server-side on upload, cache the compact JSON.** A `.vrf`
+decode is a one-time batch job (seconds, then cached forever), not a per-frame cost —
+so the "no per-user compute" goal is mostly preserved. **Nuance from Task 3:** the
+identity/map/patch metadata is cheap plaintext, so you *could* read *that* in the
+browser to show a match-picker instantly, and only send the file to the server for
+the heavy positional parse. Revisit Rust→WASM only when a shippable WASM Oodle
+exists and server cost actually bites.
 
-**Numbers to confirm on your machine (I could not):** wall-clock parse time for one
-replay, peak RAM, and the compact-JSON output size (positions dominate — sampling
-rate is your main lever to shrink it).
+**Numbers to measure on your machine:** wall-clock parse time, peak RAM, compact-JSON
+size (positions dominate; sampling rate is your shrink lever). **[UNVERIFIED]**
 
 ---
 
 ## TASK 5 — Constraints report
 
-### Definitely available (from the parser's implemented feature set)
-- Match duration; player list with **team + agent**; **positions over time**;
-  **kill/death combat events** with timestamps; movement/rotation (**view angles**
-  UNVERIFIED-but-likely, they ride the movement events).
-- Match id (filename) and on-disk timestamp — free, no parsing.
+### Definitely available
+- **No parser needed (plaintext header):** match-id, **map**, **build/patch**, and
+  **all 10 players' PUUIDs + agents**. **[VERIFIED: 1 file]**
+- **Needs the parser (implemented upstream):** player list with team+agent,
+  **positions over time**, **kill/death events with timestamps**, movement/rotation
+  (view angles ride movement — **[UNVERIFIED]** they're populated).
+- Match-id + on-disk timestamp — free.
 
 ### Available but flaky / in-progress
-- **Ability usage:** upstream marks it "in development." The web-replayer only gets
-  ability *locations* via a **manual patch** that reads channel-open/`ActorSpawned`
-  events. Assume abilities need extra work and may break patch-to-patch.
-- **Tick rate:** almost certainly derivable from the header/network settings, but
-  confirm the exact number rather than trusting a constant.
-- **Game state / world state / economy:** upstream says **"not started."** Don't
-  promise round economy, spike state beyond timing, etc., without building it.
+- **Ability usage:** upstream "in development"; web-replayer gets ability *locations*
+  only via a hand-written patch reading channel-open/`ActorSpawned`. Expect work +
+  patch-to-patch breakage.
+- **Tick rate & exact duration:** derivable from header/stream; confirm the numbers.
+- **Game/world state, economy:** upstream "not started." Don't promise it.
 
-### Definitely NOT available
-- **Real player names in competitive** — anonymized by design (`Player N`).
-- **A resolvable Riot account id inside comp replays** — assume absent.
-- Anything requiring Riot's servers while staying "offline" — mutually exclusive.
+### Corrected from the first draft
+- ~~"Real player names in competitive — gone."~~ → Display **names** are stripped,
+  but **PUUIDs are retained** in plaintext. You *can* identify players (via the API);
+  the question is whether you *should* (policy/privacy — see Task 3).
+- ~~"A resolvable Riot account id inside comp replays — assume absent."~~ →
+  **Present.** 10 PUUIDs, in the clear. **[VERIFIED: 1 file]**
 
 ### Old-patch replays / format fragility
-- **UNVERIFIED — test on your oldest files.** The runbook's self-check (10 players,
-  right agents, sane duration) is your pass/fail. My honest expectation: replays
-  from a meaningfully older patch **will parse partially or fail**, because the
-  parser is reverse-engineered field-by-field against *current* matches.
-- **Fragility signal from the repos themselves:** the original playground was
-  **archived (July 2026)** and superseded; the successor is **pre-1.0 and states
-  "API behaviour is likely to change."** The web-replayer needed a **hand-written
-  patch** just to get ability locations. This is a format with **no public spec,
-  Oodle-compressed, that Riot can change any patch** with zero notice. Plan for a
-  parser that breaks periodically and needs a maintainer — this is an ongoing cost,
-  not a one-time integration. (Note: the exact 11.06 date is muddy in public
-  sources — some point to a later regional rollout than May 2025 — worth you
-  pinning down, but it doesn't change the fragility conclusion.)
+- **Test it with `inventory.ps1`:** sort by Build; any older file where **Players<10**
+  or **Magic=`??`** is a file the current format assumptions don't fit. That's your
+  concrete old-patch fragility signal. **[UNVERIFIED — run across your 20 files]**
+- **Fragility is real regardless:** the original parser playground was **archived
+  (July 2026)** and superseded; the successor is **pre-1.0** ("API behaviour is
+  likely to change"); the web-replayer needed a manual patch for abilities. No public
+  spec, Oodle-compressed, **Riot can change it any patch**. Plan for a parser that
+  breaks periodically and needs a maintainer — ongoing cost, not one-time.
+- The magic and JSON-loadout layout could themselves shift between patches; treat the
+  `0x43F4EFDD` / field names as current-patch facts, not permanent ones.
 
-### Riot third-party policy (this is a real risk, not a footnote)
-- Riot's terms **prohibit reverse-engineering the game/API**. Parsing an
-  undocumented `.vrf` by reverse-engineering its format sits **against the letter**
-  of that, even done offline.
-- **Precedent:** Riot issued a **cease-and-desist that took Recon Bolt offline**
-  (a popular third-party Valorant app). The third-party dev community operates in a
-  gray zone Riot has shown it will act on.
-- **Reading files offline** (no Riot servers touched) is the *least* exposed posture
-  — but "offline" ends the moment you add Option-2 match-API enrichment, which
-  requires a **production API key + RSO** and Riot's data rules (opt-in data
-  sharing, the disclaimer that account-linking makes data public). That upgrade is
-  where policy risk becomes concrete.
-- **Practical stance:** an offline `.vrf` coaching tool is *lower* risk than an app
-  hitting Riot's private API, but it is **not zero**, and it depends on a format
-  Riot can break or explicitly disallow. Don't build a business assuming Riot's
-  blessing; assume you may get a C&D and have a fallback. Get real legal advice
-  before monetizing — I'm flagging risk, not clearing you.
+### Riot third-party policy (a live risk, not a footnote)
+- Riot's terms **prohibit reverse-engineering the game/API.** Parsing an undocumented
+  `.vrf` sits against the letter of that even offline.
+- **Precedent:** Riot **cease-and-desist'd Recon Bolt** offline. The community lives
+  in a gray zone Riot has shown it will act on.
+- **Offline reading of your own replays** is the lowest-exposure posture. It escalates
+  fast when you (a) call Riot's API to resolve PUUIDs→names, or (b) surface the other
+  players' identities Riot anonymized. (a) needs a production key + RSO + Riot's data
+  rules; (b) is a privacy problem on top of a policy one.
+- **Don't build a business assuming Riot's blessing.** Assume a possible C&D and keep
+  a fallback. Get real legal advice before monetizing — this flags risk, not clears it.
 
 ---
 
 ## Bottom line
-1. **Identity: just ask the user their agent.** Reliable, free, no API, no policy
-   risk. Offer Riot-account linking later as optional enrichment, not as identity.
-2. **Architecture: parse server-side on upload, cache JSON.** It's the only path
-   the parser runs on today and it kills the browser-freeze problem outright.
-   Rust→WASM is a real-but-later option gated on a shippable WASM Oodle; Blazor WASM
-   is a trap (Oodle + memory wall, heavier runtime).
-3. **The parser is the fragile part of your whole product.** No spec, Oodle,
-   Riot-can-break-it-any-patch, abilities/game-state incomplete, superseded once
-   already. Budget for a maintainer, not a one-off.
-4. **Policy is a live risk.** Offline reading is the safer posture; the moment you
-   touch Riot's API you inherit the Recon-Bolt exposure. Get legal advice before you
-   monetize.
-5. **What still needs your machine:** run the three scripts against real files to
-   confirm the header fields, the anonymization, view-angle population, tick rate,
-   old-patch parse success, and real parse-time/RAM/JSON-size numbers.
+1. **Identity is solved by the file.** RSO → match the user's PUUID to one of the 10
+   `subject`s → exact slot/agent. Agent-pick is the no-login fallback. (First draft's
+   "you can only ask" was wrong.)
+2. **Do NOT de-anonymize opponents.** Names are stripped on purpose; resolving their
+   PUUIDs is the Recon-Bolt risk zone plus a privacy problem. Coach the uploader
+   against anonymized opponents.
+3. **Cheap metadata is plaintext:** map, patch, match-id, PUUIDs, agents — readable
+   with no Oodle, even in the browser. Heavy positional data needs the parser.
+4. **Architecture: parse server-side on upload, cache JSON.** Client-side is gated by
+   proprietary Oodle + a ~1 GB working set. Rust→WASM later; Blazor WASM is a trap.
+5. **The parser is your fragile dependency.** No spec, Oodle, Riot-can-break-it,
+   abilities/state incomplete, superseded once. Budget a maintainer.
+6. **Still to verify on your machine:** run `inventory.ps1` across all 20 files
+   (old-patch fragility, player-count spread), confirm view-angle/tick-rate via the
+   full parse, and measure parse-time/RAM/JSON-size.
 
 ## Sources
 - michel-giehl/ValorantReplayParser (maintained C#/.NET parser) — https://github.com/michel-giehl/ValorantReplayParser
 - michel-giehl/ValorantReplayParserPlayground (archived predecessor) — https://github.com/michel-giehl/ValorantReplayParserPlayground
-- talhakoek/ValorantWebReplayer (server-parse viewer, anonymization notes) — https://github.com/talhakoek/ValorantWebReplayer
+- talhakoek/ValorantWebReplayer (server-parse viewer) — https://github.com/talhakoek/ValorantWebReplayer
+- Agent/object UUID list (characterId → agent) — https://gist.github.com/NotOfficer/8da2e088a596bc6acc1b46b4c2d0c64b
 - Riot "Replays: Everything You Need to Know" — https://playvalorant.com/en-us/news/dev/replays-everything-you-need-to-know/
 - Riot General Policies (reverse-engineering prohibition) — https://support-developer.riotgames.com/hc/en-us/articles/22698591841939-General-Policies
 - Riot Developer Terms — https://developer.riotgames.com/terms
-- Writeup: Riot vs the Valorant third-party dev community (Recon Bolt C&D) — https://gist.github.com/giorgi-o/e0fc2f6160a5fd43f05be8567ad6fdd7
+- Riot vs the Valorant third-party dev community (Recon Bolt C&D) — https://gist.github.com/giorgi-o/e0fc2f6160a5fd43f05be8567ad6fdd7
 - Oodle Data (Unreal) — https://dev.epicgames.com/documentation/en-us/unreal-engine/oodle-data
-- FortniteReplayDecompressor (the lineage the parser forks from) — https://fortnitereplaydecompressor.readthedocs.io/en/stable/overview/

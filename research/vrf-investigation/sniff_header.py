@@ -1,62 +1,79 @@
 #!/usr/bin/env python3
 """
-sniff_header.py  —  poke at the first bytes of ONE .vrf to see how much of the
-header is plaintext before the Oodle-compressed stream begins.
+sniff_header.py  —  inspect ONE .vrf and pull the plaintext fields Riot leaves
+in the clear (match id, build/patch, map, and every player's PUUID + agent).
 
-    python sniff_header.py path\to\<matchid>.vrf
+    python sniff_header.py path\\to\\<matchid>.vrf
 
-I could not run this against a real file (no .vrf in the cloud sandbox), so the
-field offsets below are the STANDARD Unreal local-file replay layout, not a
-Riot-confirmed layout. Use the hexdump + strings output to judge whether Riot's
-container matches it or has a custom/encrypted prefix. This is a reconnaissance
-tool, not a parser.
+VERIFIED against a real competitive replay (build release-13.04, 2026-08):
+  * Container magic is Riot's 0x43F4EFDD (NOT vanilla Unreal 0x1CA2E27F).
+  * The header + a JSON player-loadout block are PLAINTEXT (not encrypted).
+    Only the per-tick network stream that follows is Oodle-compressed.
+  * Competitive replays strip display NAMES but keep all 10 `subject` PUUIDs
+    and each player's `characterId` (agent) in the clear. See REPORT.md Task 3.
+
+This reads the whole file (it's tens of MB) to catch loadout data that sits
+past the first few KB. It is reconnaissance, not a full parser — for positions/
+kills/tick-rate you still need the C# parser (parse_one.md).
 """
-import sys, struct
+import sys, re, struct
 
-UNREAL_MAGIC = 0x1CA2E27F  # FLocalFileReplayCustomVersion magic
+RIOT_MAGIC = 0x43F4EFDD   # observed at offset 0 in real .vrf files
 
 def main(p):
     with open(p, "rb") as fh:
-        data = fh.read(8192)
-    print(f"file: {p}\nread: {len(data)} bytes (first 8 KB)\n")
+        data = fh.read()
+    print(f"file: {p}\nsize: {len(data):,} bytes ({len(data)/1024/1024:.1f} MB)\n")
 
-    # hex + ascii dump of first 256 bytes
-    print("--- first 256 bytes ---")
-    for off in range(0, min(256, len(data)), 16):
+    # --- hex dump of first 128 bytes (the fixed header) ---
+    print("--- first 128 bytes ---")
+    for off in range(0, min(128, len(data)), 16):
         chunk = data[off:off+16]
         hexs = " ".join(f"{b:02x}" for b in chunk)
         asci = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         print(f"{off:04x}  {hexs:<47}  {asci}")
 
-    # find Unreal magic
-    idx = data.find(struct.pack("<I", UNREAL_MAGIC))
-    print("\n--- unreal replay magic (0x1CA2E27F) ---")
-    if idx == -1:
-        print("NOT FOUND in first 8 KB -> Riot prefix is custom/encrypted, or magic sits deeper.")
-    else:
-        print(f"found at offset {idx}. Standard header follows: magic,uint32 fileVersion,")
-        print("int32 lengthInMs, uint32 networkVersion, uint32 changelist, FString friendlyName,")
-        print("then timestamp/bCompressed/... Try reading fileVersion/lengthInMs right after it:")
-        try:
-            fv, length_ms, netv, changelist = struct.unpack_from("<IiII", data, idx+4)
-            print(f"  fileVersion={fv}  lengthInMs={length_ms} ({length_ms/1000:.1f}s)"
-                  f"  networkVersion={netv}  changelist={changelist}")
-            print("  ^ if lengthInMs looks like a plausible match length, the layout matches.")
-        except struct.error:
-            print("  (couldn't unpack — not enough bytes)")
+    # --- container magic ---
+    magic = struct.unpack_from("<I", data, 0)[0] if len(data) >= 4 else 0
+    print(f"\nmagic @0: 0x{magic:08X}  ->  " +
+          ("Riot .vrf container (expected)" if magic == RIOT_MAGIC else
+           "UNEXPECTED — format may have shifted; rest of this may be wrong"))
 
-    # printable strings >= 4 chars (map names, agent ids, 'Player N', etc. often leak here)
-    print("\n--- printable strings (len>=4) in first 8 KB ---")
-    cur, out = [], []
-    for b in data:
-        if 32 <= b < 127:
-            cur.append(chr(b))
-        else:
-            if len(cur) >= 4: out.append("".join(cur))
-            cur = []
-    if len(cur) >= 4: out.append("".join(cur))
-    for s in out[:60]:
-        print(f"  {s}")
+    # A few uint32s live between the magic and the match-id FString. One of them
+    # is plausibly lengthInMs. Printed as candidates, not asserted.
+    if len(data) >= 44:
+        cands = struct.unpack_from("<III", data, 0x1c)  # 0x1c..0x28
+        print("candidate uint32s @0x1c/0x20/0x24 (one may be duration-ms):",
+              [f"{c} (~{c/1000:.0f}s)" for c in cands])
+
+    # --- plaintext strings we care about (scan whole file) ---
+    def uniq(pat, label, limit=64):
+        vals = []
+        for m in re.finditer(pat, data):
+            v = m.group(0).decode("latin1")
+            if v not in vals:
+                vals.append(v)
+        print(f"\n--- {label}: {len(vals)} unique ---")
+        for v in vals[:limit]:
+            print(f"  {v}")
+        return vals
+
+    uniq(rb"\+\+[A-Za-z0-9]+-Core\+release-[0-9.]+", "build / patch label")
+    uniq(rb"/Game/Maps/[A-Za-z0-9_]+/[A-Za-z0-9_]+", "map path")
+    subs  = uniq(rb'"subject":\s*"[0-9a-f-]{36}"', "player PUUIDs (subject)")
+    chars = uniq(rb'"characterId":\s*"[0-9a-f-]{36}"', "agents (characterId)")
+
+    # name fields — expected EMPTY in competitive (that's the anonymization)
+    names = uniq(rb'"(?:gameName|tagLine|displayName|playerName)":\s*"[^"]*"',
+                 "display-name fields (expect EMPTY in competitive)")
+
+    print("\n=== READ-OUT ===")
+    print(f"  players (unique PUUIDs): {len(subs)}   (10 => full lobby present)")
+    print(f"  distinct agents:         {len(chars)} (may be <10; agents overlap across teams)")
+    print(f"  leaked names:            {len(names)} "
+          f"({'anonymized — names stripped, PUUIDs remain' if not names else 'NOT anonymized (custom/scrim?)'})")
+    print("  NOTE: PUUIDs are stable Riot account ids. Resolving them to gamertags")
+    print("        needs Riot's API and is the Recon-Bolt policy-risk zone (REPORT.md).")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
